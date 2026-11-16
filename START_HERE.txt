@@ -1,0 +1,33 @@
+AVENUEx / ACCOUNTS MANAGEMENT — LOCAL DEMO
+
+WINDOWS START (Python is NOT required)
+1. Extract this ZIP to a normal folder (do not run inside the ZIP preview).
+2. Open the extracted Accounts_Management_Professional folder.
+3. Double-click Start_Local_Demo_Windows.bat.
+4. Keep the PowerShell window open while using the app.
+5. Merchant workspace opens at http://localhost:8000/.
+6. Click “Open customer store” to open the customer-only storefront preview.
+
+IMPORTANT DATA NOTES
+- The merchant workspace and customer storefront share data in this same browser profile.
+- Customer orders and support messages placed in storefront.html appear in the merchant workspace while the local app is running (or after refresh).
+- Export backup regularly using the Export backup button.
+- Do not delete all products/sales unless you have exported a backup.
+- Python is not used by the Windows launcher. The launcher uses Windows PowerShell.
+
+PRODUCTION LIMITATIONS
+This is a local demo, not a public website or secure cloud ERP. It does not sync between customer devices, provide server-side roles, secure multi-user authentication, real payment processing, WhatsApp API, or distance/petrol-based delivery pricing. USD / Payoneer / Wise payment options are manual instructions only. GPS coordinates are captured only with browser permission.
+
+LATEST UPDATE — DELIVERY RIDERS & THERMAL PRINTING
+1. Open Settings → Delivery riders.
+2. Add rider name, bike number, phone number and optional notes. You can add riders whenever needed.
+3. Open Online Store & Orders and choose a rider in the Assigned rider column for each order.
+4. Customers can enter their checkout phone number in “Track your order & delivery rider” on the shop page to view order status and assigned rider contact.
+5. For counter POS bills, select a rider in the POS Delivery rider field.
+6. In Settings → Thermal receipt printer, choose 58mm or 80mm to match your printer roll. Also select the same paper width in Windows printer preferences.
+
+V4 RECEIPT / BANK PAYMENT UPDATE
+- Compact 58mm receipt is selected by default; you can switch to 80mm in Settings.
+- Online checkout asks customer to select their sending bank for Bank Transfer. Add bank choices in Settings separated by commas.
+- When merchant marks bank payment received, the printed invoice shows the selected bank and PAID / RECEIVED status.
+- The receipt uses a clean, compact layout with aligned amount columns and minimal decoration.

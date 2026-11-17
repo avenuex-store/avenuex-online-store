@@ -3,6 +3,7 @@
    ACCOUNTS MANAGEMENT — AVENUEx
    Complete app.js replacement
    Local business data + Supabase admin login + cloud orders
+   Automatic product/SKU sync
 ========================================================= */
 
 'use strict';
@@ -11,36 +12,6 @@ const KEY = 'am-professional-v1';
 const SUPABASE_URL = 'https://mtwlyaauzjlzfpezfzap.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_MOehj93WpdBVu99gwF2Ndw_azfQMESE';
 const PLACE_ORDER_URL = SUPABASE_URL + '/functions/v1/place-order';
-
-async function syncProductsToSupabase() {
-  if (!db?.products?.length) {
-    notify('Website product list is empty.', 'error');
-    return;
-  }
-
-  const rows = db.products.map(p => ({
-    sku: String(p.code),
-    name: String(p.name),
-    brand: String(p.brand || ''),
-    purchase_price: num(p.purchase),
-    sale_price: num(p.rate),
-    stock_quantity: num(p.opening) + num(p.stockIn),
-    is_active: true
-  }));
-
-  const { data, error } = await cloud
-    .from('products')
-    .upsert(rows, { onConflict: 'sku' })
-    .select();
-
-  if (error) {
-    console.error(error);
-    notify('Product sync failed: ' + error.message, 'error');
-    return;
-  }
-
-  notify(`${data.length} products synced successfully.`);
-}
 
 const $ = id => document.getElementById(id);
 const all = selector => [...document.querySelectorAll(selector)];
@@ -196,6 +167,74 @@ async function loadSupabase() {
   return cloud;
 }
 
+/* AUTOMATIC PRODUCT / SKU SYNC */
+
+async function syncProductToSupabase(p) {
+  if (!cloud || !currentUser) {
+    notify('Product saved locally. Admin cloud login required for sync.', 'error');
+    return false;
+  }
+
+  const sku = String(p.code || '').trim();
+  const name = String(p.name || '').trim();
+
+  if (!sku || !name) {
+    notify('Product SKU and name are required for cloud sync.', 'error');
+    return false;
+  }
+
+  const row = {
+    sku,
+    name,
+    purchase_price: num(p.purchase),
+    sale_price: num(p.rate),
+    stock_quantity: productStock(p),
+    is_active: true
+  };
+
+  const { error } = await cloud
+    .from('products')
+    .upsert(row, { onConflict: 'sku' });
+
+  if (error) {
+    console.error('Product sync error:', error);
+    notify('Product saved locally; Supabase sync failed: ' + error.message, 'error');
+    return false;
+  }
+
+  notify('Product saved and SKU synced to Supabase.');
+  return true;
+}
+
+async function syncProductsToSupabase() {
+  if (!cloud || !currentUser) {
+    notify('Please login as admin before syncing products.', 'error');
+    return false;
+  }
+
+  if (!db?.products?.length) {
+    notify('Website product list is empty.', 'error');
+    return false;
+  }
+
+  let success = 0;
+  let failed = 0;
+
+  for (const p of db.products) {
+    const result = await syncProductToSupabase(p);
+    if (result) success++;
+    else failed++;
+  }
+
+  if (failed === 0) {
+    notify(`${success} products synced successfully.`);
+  } else {
+    notify(`${success} synced; ${failed} failed. Check console.`, 'error');
+  }
+
+  return failed === 0;
+}
+
 function showLogin() {
   if ($('cloudLogin')) return;
 
@@ -242,6 +281,8 @@ function showLogin() {
 
       panel.remove();
       notify('Admin login successful.');
+
+      await syncProductsToSupabase();
       await syncCloudOrders();
     } catch (err) {
       error.textContent = err.message || 'Login failed.';
@@ -634,21 +675,36 @@ function editProduct(id) {
   if (p) openProductDialog(p);
 }
 
-function saveProduct(e) {
+/* SAVE PRODUCT + AUTOMATIC SUPABASE SKU SYNC */
+
+async function saveProduct(e) {
   e.preventDefault();
 
   const code = $('pCode')?.value.trim();
   const name = $('pName')?.value.trim();
-  if (!code || !name) return notify('Product code and name are required.', 'error');
+
+  if (!code || !name) {
+    return notify('Product code and name are required.', 'error');
+  }
 
   const duplicate = db.products.find(p =>
-    String(p.code) === code && p.id !== editingProductId
+    String(p.code) === code && String(p.id) !== String(editingProductId)
   );
-  if (duplicate) return notify('This product code already exists.', 'error');
+
+  if (duplicate) {
+    return notify('This product code already exists.', 'error');
+  }
+
+  const oldProduct = editingProductId
+    ? db.products.find(p => String(p.id) === String(editingProductId))
+    : null;
+
+  const oldCode = oldProduct?.code;
 
   const product = {
     id: editingProductId || uid(),
-    code, name,
+    code,
+    name,
     brand: $('pBrand')?.value || '',
     unit: $('pUnit')?.value || '',
     opening: num($('pOpening')?.value),
@@ -659,8 +715,10 @@ function saveProduct(e) {
   };
 
   if (editingProductId) {
-    const index = db.products.findIndex(p => p.id === editingProductId);
-    db.products[index] = product;
+    const index = db.products.findIndex(
+      p => String(p.id) === String(editingProductId)
+    );
+    if (index !== -1) db.products[index] = product;
   } else {
     db.products.push(product);
   }
@@ -668,7 +726,21 @@ function saveProduct(e) {
   save();
   renderInventory();
   $('productDialog')?.close();
-  notify('Product saved.');
+
+  // If SKU changed, deactivate the old cloud SKU.
+  if (oldCode && String(oldCode) !== String(code) && cloud && currentUser) {
+    const { error } = await cloud
+      .from('products')
+      .update({ is_active: false })
+      .eq('sku', String(oldCode));
+
+    if (error) {
+      console.error('Old SKU deactivation error:', error);
+      notify('New product saved, but old SKU could not be deactivated.', 'error');
+    }
+  }
+
+  await syncProductToSupabase(product);
 }
 
 function deleteSelectedProducts() {
@@ -676,14 +748,28 @@ function deleteSelectedProducts() {
   if (!ids.length) return notify('Select products first.', 'error');
   if (!confirm(`Delete ${ids.length} selected products?`)) return;
 
+  const removed = db.products.filter(p => ids.includes(String(p.id)));
+
   db.products = db.products.filter(p => !ids.includes(String(p.id)));
   save();
   renderInventory();
+
+  // Deactivate deleted products in Supabase.
+  if (cloud && currentUser) {
+    removed.forEach(async p => {
+      const { error } = await cloud
+        .from('products')
+        .update({ is_active: false })
+        .eq('sku', String(p.code));
+
+      if (error) console.error('Cloud product deactivation:', error);
+    });
+  }
 }
 
 function importProductsCSV(file) {
   const reader = new FileReader();
-  reader.onload = () => {
+  reader.onload = async () => {
     const lines = String(reader.result).split(/\r?\n/).filter(Boolean);
     const headers = lines.shift().split(',').map(x => x.trim().toLowerCase());
 
@@ -714,6 +800,10 @@ function importProductsCSV(file) {
     save();
     renderInventory();
     notify('CSV import completed.');
+
+    if (cloud && currentUser) {
+      await syncProductsToSupabase();
+    }
   };
   reader.readAsText(file);
 }
@@ -1095,6 +1185,8 @@ function importBackup(file) {
       save();
       renderAll();
       notify('Backup restored.');
+
+      if (cloud && currentUser) syncProductsToSupabase();
     } catch {
       notify('Invalid backup file.', 'error');
     }
@@ -1268,7 +1360,7 @@ async function init() {
 
   if (!posLines.length) addPosLine();
 
-  // Supabase admin login and cloud order sync
+  // Supabase admin login and product/order sync
   await requireAdmin();
 
   // Keep online orders refreshed while the admin page is open

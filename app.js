@@ -1,15 +1,26 @@
 
 'use strict';
 
-/* AVENUEx — ACCOUNTS MANAGEMENT
-   Supabase-connected business management
-*/
+/* =====================================================
+   AVENUEx — ACCOUNTS MANAGEMENT
+   COMPLETE CLOUD SYNC VERSION
+   Original local database + Supabase
+===================================================== */
 
 const SUPABASE_URL = 'https://mtwlyaauzjlzfpezfzap.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_MOehj93WpdBVu99gwF2Ndw_azfQMESE';
-const DB_KEY = 'avenuex-business-v1';
 
-let supabaseClient;
+/* IMPORTANT: Original website database key */
+const DB_KEY = 'am-professional-v1';
+
+const $ = id => document.getElementById(id);
+const n = value => Number(value) || 0;
+const uid = () => crypto.randomUUID();
+
+let supabaseClient = null;
+let syncRunning = false;
+let syncTimer = null;
+
 let state = {
   products: [],
   sales: [],
@@ -20,22 +31,54 @@ let state = {
   settings: {}
 };
 
-const $ = id => document.getElementById(id);
-const n = value => Number(value) || 0;
-const uid = () => crypto.randomUUID();
+/* =====================================================
+   LOCAL DATABASE
+===================================================== */
+
+function readLocalDatabase() {
+  const keys = [
+    'am-professional-v1',
+    'avenuex-business-v1'
+  ];
+
+  for (const key of keys) {
+    try {
+      const saved = JSON.parse(localStorage.getItem(key) || 'null');
+
+      if (saved && typeof saved === 'object') {
+        return saved;
+      }
+    } catch (error) {
+      console.error('Database read error:', key, error);
+    }
+  }
+
+  return {};
+}
+
+function loadLocal() {
+  const saved = readLocalDatabase();
+
+  state = {
+    ...state,
+    ...saved,
+    products: Array.isArray(saved.products) ? saved.products : [],
+    sales: Array.isArray(saved.sales) ? saved.sales : [],
+    purchases: Array.isArray(saved.purchases) ? saved.purchases : [],
+    customers: Array.isArray(saved.customers) ? saved.customers : [],
+    suppliers: Array.isArray(saved.suppliers) ? saved.suppliers : [],
+    orders: Array.isArray(saved.orders) ? saved.orders : [],
+    settings: saved.settings || {}
+  };
+}
 
 function saveLocal() {
   localStorage.setItem(DB_KEY, JSON.stringify(state));
 }
 
-function loadLocal() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(DB_KEY) || '{}');
-    state = { ...state, ...saved };
-  } catch (error) {
-    console.error('Local database error:', error);
-  }
-}
+/* =====================================================
+   SUPABASE CONNECTION
+===================================================== */
 
 async function connectCloud() {
   if (supabaseClient) return supabaseClient;
@@ -43,227 +86,484 @@ async function connectCloud() {
   if (!window.supabase) {
     await new Promise((resolve, reject) => {
       const script = document.createElement('script');
-      script.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
+
+      script.src =
+        'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
+
       script.onload = resolve;
-      script.onerror = reject;
+      script.onerror = () =>
+        reject(new Error('Supabase library could not load'));
+
       document.head.appendChild(script);
     });
   }
 
   supabaseClient = window.supabase.createClient(
     SUPABASE_URL,
-    SUPABASE_KEY
+    SUPABASE_KEY,
+    {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true
+      }
+    }
   );
 
   return supabaseClient;
 }
+
+async function requireAdmin() {
+  await connectCloud();
+
+  const { data, error } =
+    await supabaseClient.auth.getSession();
+
+  if (error) throw error;
+
+  if (!data.session) {
+    throw new Error('Please login with your admin account first');
+  }
+
+  return data.session;
+}
+
+/* =====================================================
+   LOGIN / LOGOUT
+===================================================== */
 
 async function login(email, password) {
   try {
     await connectCloud();
 
     const { data, error } =
-      await supabaseClient.auth.signInWithPassword({ email, password });
+      await supabaseClient.auth.signInWithPassword({
+        email: String(email).trim(),
+        password
+      });
 
     if (error) throw error;
 
     showMessage('Admin login successful');
-    await syncAll();
+
+    await syncAllProducts();
+    await syncOrders();
+
     return data.user;
+
   } catch (error) {
-    showMessage(error.message);
+    showMessage('Login failed: ' + error.message);
+    console.error(error);
     return null;
   }
 }
 
 async function logout() {
-  await connectCloud();
-  await supabaseClient.auth.signOut();
-  showMessage('Logged out');
+  try {
+    await connectCloud();
+
+    const { error } =
+      await supabaseClient.auth.signOut();
+
+    if (error) throw error;
+
+    showMessage('Logged out successfully');
+
+  } catch (error) {
+    showMessage(error.message);
+  }
 }
 
-async function requireAdmin() {
-  await connectCloud();
-
-  const { data, error } = await supabaseClient.auth.getSession();
-  if (error) throw error;
-  if (!data.session) throw new Error('Admin login required');
-
-  return data.session;
-}
+/* =====================================================
+   MESSAGE
+===================================================== */
 
 function showMessage(message) {
-  console.log(message);
+  console.log('AVENUEx:', message);
+
   const area = $('message');
+
   if (area) area.textContent = message;
 }
 
-async function saveProduct(product) {
-  const sku = String(product.sku || product.code || '').trim();
-  const name = String(product.name || '').trim();
+/* =====================================================
+   PRODUCT FIELD MAPPING
+   Reads the existing Stock Master product fields
+===================================================== */
 
-  if (!sku || !name) throw new Error('SKU and product name required');
+function getSKU(product) {
+  return String(
+    product.sku ??
+    product.code ??
+    product.productCode ??
+    product.itemCode ??
+    ''
+  ).trim();
+}
 
-  const item = {
-    ...product,
-    id: product.id || uid(),
+function getProductName(product) {
+  return String(
+    product.name ??
+    product.productName ??
+    product.itemName ??
+    ''
+  ).trim();
+}
+
+function getStock(product) {
+  if (product.stock_quantity !== undefined) {
+    return n(product.stock_quantity);
+  }
+
+  if (product.stock !== undefined) {
+    return n(product.stock);
+  }
+
+  if (product.quantity !== undefined) {
+    return n(product.quantity);
+  }
+
+  return n(product.opening) + n(product.stockIn);
+}
+
+function makeProductRow(product) {
+  const sku = getSKU(product);
+  const name = getProductName(product);
+
+  if (!sku || !name) return null;
+
+  return {
     sku,
     name,
-    purchase_price: n(product.purchase_price ?? product.purchase),
-    sale_price: n(product.sale_price ?? product.rate),
-    stock_quantity: n(product.stock_quantity ?? product.stock)
+
+    purchase_price: n(
+      product.purchase_price ??
+      product.purchase ??
+      product.purchasePrice ??
+      product.purchaseRate
+    ),
+
+    sale_price: n(
+      product.sale_price ??
+      product.rate ??
+      product.salePrice ??
+      product.sellingPrice
+    ),
+
+    stock_quantity: getStock(product),
+
+    is_active: product.is_active !== false
   };
-
-  const index = state.products.findIndex(p => p.sku === sku);
-
-  if (index >= 0) state.products[index] = item;
-  else state.products.push(item);
-
-  saveLocal();
-  await syncProduct(item);
-  render();
-  return item;
 }
+
+/* =====================================================
+   SINGLE PRODUCT CLOUD SYNC
+===================================================== */
 
 async function syncProduct(product) {
   await requireAdmin();
 
-  const row = {
-    sku: String(product.sku || product.code),
-    name: product.name,
-    purchase_price: n(product.purchase_price ?? product.purchase),
-    sale_price: n(product.sale_price ?? product.rate),
-    stock_quantity: n(product.stock_quantity ?? product.stock),
-    is_active: true
-  };
+  const row = makeProductRow(product);
+
+  if (!row) {
+    throw new Error('Product SKU or name is missing');
+  }
 
   const { error } = await supabaseClient
     .from('products')
-    .upsert(row, { onConflict: 'sku' });
+    .upsert(row, {
+      onConflict: 'sku'
+    });
 
   if (error) throw error;
+
+  console.log('PRODUCT SYNCED:', row.sku, row.name);
+
+  return true;
 }
+
+/* =====================================================
+   ALL STOCK MASTER PRODUCTS CLOUD SYNC
+===================================================== */
 
 async function syncAllProducts() {
-  await requireAdmin();
+  if (syncRunning) return;
 
-  let success = 0;
-  let failed = 0;
+  syncRunning = true;
 
-  for (const product of state.products) {
-    try {
-      await syncProduct(product);
-      success++;
-    } catch (error) {
-      failed++;
-      console.error(product.name, error);
+  try {
+    await requireAdmin();
+
+    loadLocal();
+
+    const products = state.products || [];
+
+    if (!products.length) {
+      showMessage(
+        'No products found in local Stock Master database'
+      );
+      return;
     }
-  }
 
-  showMessage(`Products synced: ${success}; Failed: ${failed}`);
+    const rows = products
+      .map(makeProductRow)
+      .filter(Boolean);
+
+    if (!rows.length) {
+      showMessage(
+        'Products found, but SKU or product names are missing'
+      );
+      return;
+    }
+
+    let success = 0;
+    let failed = 0;
+
+    for (let i = 0; i < rows.length; i += 100) {
+      const batch = rows.slice(i, i + 100);
+
+      const { error } = await supabaseClient
+        .from('products')
+        .upsert(batch, {
+          onConflict: 'sku'
+        });
+
+      if (error) {
+        console.error('Cloud batch failed:', error);
+        failed += batch.length;
+      } else {
+        success += batch.length;
+      }
+    }
+
+    const message =
+      `Product sync complete. Success: ${success}, Failed: ${failed}`;
+
+    showMessage(message);
+
+    console.log(message);
+
+    return { success, failed };
+
+  } catch (error) {
+    showMessage('Product sync failed: ' + error.message);
+    console.error(error);
+
+    return {
+      success: 0,
+      failed: state.products.length
+    };
+
+  } finally {
+    syncRunning = false;
+  }
 }
+
+/* =====================================================
+   LOAD PRODUCTS FROM CLOUD
+===================================================== */
 
 async function loadCloudProducts() {
-  await connectCloud();
+  try {
+    await requireAdmin();
 
-  const { data, error } = await supabaseClient
-    .from('products')
-    .select('*')
-    .eq('is_active', true)
-    .order('name');
+    const { data, error } = await supabaseClient
+      .from('products')
+      .select('*')
+      .eq('is_active', true)
+      .order('name');
 
-  if (error) throw error;
+    if (error) throw error;
 
-  state.products = data || [];
-  saveLocal();
-  render();
+    showMessage(
+      `${(data || []).length} cloud products loaded`
+    );
+
+    return data || [];
+
+  } catch (error) {
+    showMessage('Cloud loading failed: ' + error.message);
+    return [];
+  }
 }
 
-async function saveSale(sale) {
-  await requireAdmin();
+/* =====================================================
+   ORDERS CLOUD SYNC
+===================================================== */
 
-  const total = n(sale.total);
+async function syncOrders() {
+  try {
+    await requireAdmin();
+
+    const { data, error } = await supabaseClient
+      .from('orders')
+      .select(
+        '*,order_items(id,product_id,product_name,sku,quantity)'
+      )
+      .order('created_at', {
+        ascending: false
+      });
+
+    if (error) throw error;
+
+    state.orders = data || [];
+
+    saveLocal();
+    render();
+
+    showMessage(
+      `${state.orders.length} cloud orders loaded`
+    );
+
+    return state.orders;
+
+  } catch (error) {
+    console.error('Order sync failed:', error);
+    showMessage('Order sync failed: ' + error.message);
+    return [];
+  }
+}
+
+async function updateOrderStatus(id, status) {
+  try {
+    await requireAdmin();
+
+    const { error } = await supabaseClient
+      .from('orders')
+      .update({ status })
+      .eq('id', id);
+
+    if (error) throw error;
+
+    await syncOrders();
+
+    showMessage('Order status updated');
+
+  } catch (error) {
+    showMessage(error.message);
+  }
+}
+
+/* =====================================================
+   SAVE PRODUCT
+===================================================== */
+
+async function saveProduct(product) {
+  const row = makeProductRow(product);
+
+  if (!row) {
+    throw new Error('Product SKU and name are required');
+  }
+
+  const index = state.products.findIndex(
+    p => getSKU(p) === row.sku
+  );
+
+  const item = {
+    ...product,
+    sku: row.sku,
+    name: row.name
+  };
+
+  if (index >= 0) {
+    state.products[index] = item;
+  } else {
+    state.products.push({
+      id: product.id || uid(),
+      ...item
+    });
+  }
+
+  saveLocal();
+  render();
+
+  try {
+    await syncProduct(item);
+    showMessage('Product saved and synced to cloud');
+  } catch (error) {
+    showMessage(
+      'Product saved locally. Cloud sync pending: ' +
+      error.message
+    );
+  }
+
+  return item;
+}
+
+/* =====================================================
+   SALES LOCAL SAVE
+   Cloud sales table is not assumed because its schema
+   has not been confirmed.
+===================================================== */
+
+async function saveSale(sale) {
   const record = {
     ...sale,
     id: sale.id || uid(),
-    total,
+    total: n(sale.total),
     created_at: new Date().toISOString()
   };
 
   state.sales.push(record);
+
   saveLocal();
-
-  const { error } = await supabaseClient
-    .from('sales')
-    .insert(record);
-
-  if (error) {
-    console.error('Cloud sale sync failed:', error);
-    showMessage('Sale saved locally; cloud sync failed: ' + error.message);
-    return false;
-  }
-
   render();
+
+  showMessage('Sale saved locally');
+
   return true;
 }
 
+/* =====================================================
+   GENERAL SYNC
+===================================================== */
+
 async function syncAll() {
   try {
-    await syncAllProducts();
-    await syncOrders();
+    const products = await syncAllProducts();
+    const orders = await syncOrders();
+
+    return {
+      products,
+      orders
+    };
+
   } catch (error) {
-    showMessage('Sync failed: ' + error.message);
+    showMessage('Cloud sync error: ' + error.message);
+    console.error(error);
   }
 }
 
-async function syncOrders() {
-  await requireAdmin();
-
-  const { data, error } = await supabaseClient
-    .from('orders')
-    .select('*,order_items(id,product_id,product_name,sku,quantity)')
-    .order('created_at', { ascending: false });
-
-  if (error) throw error;
-
-  state.orders = data || [];
-  saveLocal();
-  render();
-}
-
-async function updateOrderStatus(id, status) {
-  await requireAdmin();
-
-  const { error } = await supabaseClient
-    .from('orders')
-    .update({ status })
-    .eq('id', id);
-
-  if (error) throw error;
-
-  await syncOrders();
-}
+/* =====================================================
+   RENDER
+===================================================== */
 
 function render() {
-  const products = $('productsTable');
+  const productsTable = $('productsTable');
 
-  if (products) {
-    products.innerHTML = state.products.map(p => `
+  if (productsTable) {
+    productsTable.innerHTML = state.products.map(p => `
       <tr>
-        <td>${escapeHTML(p.sku || p.code)}</td>
-        <td>${escapeHTML(p.name)}</td>
+        <td>${escapeHTML(getSKU(p))}</td>
+        <td>${escapeHTML(getProductName(p))}</td>
         <td>${escapeHTML(p.brand || '')}</td>
-        <td>${n(p.stock_quantity ?? p.stock)}</td>
-        <td>${n(p.sale_price ?? p.rate)}</td>
+        <td>${getStock(p)}</td>
+        <td>${n(p.sale_price ?? p.rate ?? p.salePrice)}</td>
       </tr>
     `).join('');
   }
 
-  const count = $('productCount');
-  if (count) count.textContent = state.products.length;
+  const productCount = $('productCount');
+
+  if (productCount) {
+    productCount.textContent = state.products.length;
+  }
 
   const orderCount = $('orderCount');
-  if (orderCount) orderCount.textContent = state.orders.length;
+
+  if (orderCount) {
+    orderCount.textContent = state.orders.length;
+  }
 }
 
 function escapeHTML(value) {
@@ -276,18 +576,66 @@ function escapeHTML(value) {
   })[c]);
 }
 
+/* =====================================================
+   BACKUP
+===================================================== */
+
 function exportBackup() {
-  const blob = new Blob([JSON.stringify(state, null, 2)], {
-    type: 'application/json'
-  });
+  const blob = new Blob(
+    [JSON.stringify(state, null, 2)],
+    { type: 'application/json' }
+  );
 
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
+
   link.href = url;
   link.download = 'avenuex-backup.json';
   link.click();
+
   URL.revokeObjectURL(url);
 }
+
+/* =====================================================
+   AUTOMATIC LOCAL DATABASE CHANGE DETECTION
+===================================================== */
+
+function enableAutomaticSync() {
+  const originalSetItem =
+    Storage.prototype.setItem;
+
+  if (Storage.prototype.__avenuexPatched) return;
+
+  Storage.prototype.setItem = function(key, value) {
+    originalSetItem.call(this, key, value);
+
+    if (
+      key === DB_KEY ||
+      key === 'avenuex-business-v1'
+    ) {
+      clearTimeout(syncTimer);
+
+      syncTimer = setTimeout(async () => {
+        try {
+          const { data } =
+            await supabaseClient.auth.getSession();
+
+          if (data.session) {
+            await syncAllProducts();
+          }
+        } catch (error) {
+          console.error('Automatic sync:', error);
+        }
+      }, 2000);
+    }
+  };
+
+  Storage.prototype.__avenuexPatched = true;
+}
+
+/* =====================================================
+   INITIALIZATION
+===================================================== */
 
 async function init() {
   loadLocal();
@@ -295,15 +643,42 @@ async function init() {
 
   try {
     await connectCloud();
-    const { data } = await supabaseClient.auth.getSession();
+
+    enableAutomaticSync();
+
+    const { data, error } =
+      await supabaseClient.auth.getSession();
+
+    if (error) throw error;
 
     if (data.session) {
       await syncAll();
     }
+
+    supabaseClient.auth.onAuthStateChange(
+      (event, session) => {
+        if (
+          session &&
+          event === 'SIGNED_IN'
+        ) {
+          setTimeout(syncAll, 500);
+        }
+      }
+    );
+
+    console.log('AVENUEx Cloud System Ready');
+
   } catch (error) {
-    console.error('AVENUEx initialization:', error);
+    console.error(
+      'AVENUEx Cloud Initialization:',
+      error.message
+    );
   }
 }
+
+/* =====================================================
+   PUBLIC APP FUNCTIONS
+===================================================== */
 
 window.AvenueX = {
   login,
@@ -315,10 +690,17 @@ window.AvenueX = {
   saveSale,
   syncOrders,
   updateOrderStatus,
+  syncAll,
   exportBackup,
+
   get data() {
+    loadLocal();
     return state;
   }
 };
 
-document.addEventListener('DOMContentLoaded', init);
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}

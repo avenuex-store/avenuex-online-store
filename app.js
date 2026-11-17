@@ -1,589 +1,324 @@
 
 'use strict';
 
-/* =====================================================
-   AVENUEx — ACCOUNTS MANAGEMENT
-   Supabase Admin + Products + POS + Sales + Cloud Orders
-===================================================== */
+/* AVENUEx — ACCOUNTS MANAGEMENT
+   Supabase-connected business management
+*/
 
-const KEY = 'am-professional-v1';
 const SUPABASE_URL = 'https://mtwlyaauzjlzfpezfzap.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_MOehj93WpdBVu99gwF2Ndw_azfQMESE';
-const PLACE_ORDER_URL = SUPABASE_URL + '/functions/v1/place-order';
+const DB_KEY = 'avenuex-business-v1';
 
-const $ = id => document.getElementById(id);
-const num = value => Number(value) || 0;
-const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-
-const DEFAULTS = {
-  businessName: 'Accounts Management',
-  currency: 'PKR',
+let supabaseClient;
+let state = {
   products: [],
   sales: [],
+  purchases: [],
+  customers: [],
+  suppliers: [],
   orders: [],
   settings: {}
 };
 
-let db = null;
-let cloud = null;
-let currentUser = null;
-let cart = [];
+const $ = id => document.getElementById(id);
+const n = value => Number(value) || 0;
+const uid = () => crypto.randomUUID();
 
-function money(value) {
-  return 'Rs ' + num(value).toLocaleString('en-PK', {
-    maximumFractionDigits: 2
-  });
+function saveLocal() {
+  localStorage.setItem(DB_KEY, JSON.stringify(state));
 }
 
-function notify(message) {
-  alert(message);
-}
-
-function loadDatabase() {
+function loadLocal() {
   try {
-    const saved = localStorage.getItem(KEY);
-    db = saved ? { ...DEFAULTS, ...JSON.parse(saved) } : structuredClone(DEFAULTS);
-    db.products ||= [];
-    db.sales ||= [];
-    db.orders ||= [];
+    const saved = JSON.parse(localStorage.getItem(DB_KEY) || '{}');
+    state = { ...state, ...saved };
   } catch (error) {
-    console.error(error);
-    db = structuredClone(DEFAULTS);
+    console.error('Local database error:', error);
   }
 }
 
-function saveDatabase() {
-  localStorage.setItem(KEY, JSON.stringify(db));
-}
-
-async function loadSupabase() {
-  if (cloud) return cloud;
+async function connectCloud() {
+  if (supabaseClient) return supabaseClient;
 
   if (!window.supabase) {
     await new Promise((resolve, reject) => {
       const script = document.createElement('script');
       script.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
       script.onload = resolve;
-      script.onerror = () => reject(new Error('Supabase library failed to load'));
+      script.onerror = reject;
       document.head.appendChild(script);
     });
   }
 
-  cloud = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
-  return cloud;
+  supabaseClient = window.supabase.createClient(
+    SUPABASE_URL,
+    SUPABASE_KEY
+  );
+
+  return supabaseClient;
 }
 
-async function verifyAdmin(email, password) {
+async function login(email, password) {
   try {
-    await loadSupabase();
+    await connectCloud();
 
-    const { data, error } = await cloud.auth.signInWithPassword({
-      email,
-      password
-    });
+    const { data, error } =
+      await supabaseClient.auth.signInWithPassword({ email, password });
 
     if (error) throw error;
 
-    currentUser = data.user;
-    await syncProductsToSupabase();
-    await syncCloudOrders();
-
-    notify('Admin login successful');
-    return true;
+    showMessage('Admin login successful');
+    await syncAll();
+    return data.user;
   } catch (error) {
-    notify('Login failed: ' + error.message);
-    return false;
+    showMessage(error.message);
+    return null;
   }
 }
 
-async function logoutAdmin() {
-  if (cloud) await cloud.auth.signOut();
-  currentUser = null;
-  notify('Logged out');
+async function logout() {
+  await connectCloud();
+  await supabaseClient.auth.signOut();
+  showMessage('Logged out');
 }
 
 async function requireAdmin() {
-  await loadSupabase();
+  await connectCloud();
 
-  const { data, error } = await cloud.auth.getSession();
+  const { data, error } = await supabaseClient.auth.getSession();
+  if (error) throw error;
+  if (!data.session) throw new Error('Admin login required');
+
+  return data.session;
+}
+
+function showMessage(message) {
+  console.log(message);
+  const area = $('message');
+  if (area) area.textContent = message;
+}
+
+async function saveProduct(product) {
+  const sku = String(product.sku || product.code || '').trim();
+  const name = String(product.name || '').trim();
+
+  if (!sku || !name) throw new Error('SKU and product name required');
+
+  const item = {
+    ...product,
+    id: product.id || uid(),
+    sku,
+    name,
+    purchase_price: n(product.purchase_price ?? product.purchase),
+    sale_price: n(product.sale_price ?? product.rate),
+    stock_quantity: n(product.stock_quantity ?? product.stock)
+  };
+
+  const index = state.products.findIndex(p => p.sku === sku);
+
+  if (index >= 0) state.products[index] = item;
+  else state.products.push(item);
+
+  saveLocal();
+  await syncProduct(item);
+  render();
+  return item;
+}
+
+async function syncProduct(product) {
+  await requireAdmin();
+
+  const row = {
+    sku: String(product.sku || product.code),
+    name: product.name,
+    purchase_price: n(product.purchase_price ?? product.purchase),
+    sale_price: n(product.sale_price ?? product.rate),
+    stock_quantity: n(product.stock_quantity ?? product.stock),
+    is_active: true
+  };
+
+  const { error } = await supabaseClient
+    .from('products')
+    .upsert(row, { onConflict: 'sku' });
 
   if (error) throw error;
-
-  if (!data.session) {
-    throw new Error('Please login as admin first');
-  }
-
-  currentUser = data.session.user;
-  return true;
 }
 
-function productSKU(product) {
-  return String(product.sku || product.code || '').trim();
-}
-
-async function syncProductToSupabase(product) {
-  try {
-    await requireAdmin();
-
-    const sku = productSKU(product);
-    const name = String(product.name || '').trim();
-
-    if (!sku || !name) {
-      throw new Error('Product SKU and name are required');
-    }
-
-    const row = {
-      sku,
-      name,
-      purchase_price: num(product.purchase_price ?? product.purchase ?? product.purchasePrice),
-      sale_price: num(product.sale_price ?? product.rate ?? product.salePrice),
-      stock_quantity: num(product.stock_quantity ?? product.stock ?? product.quantity),
-      is_active: product.is_active !== false
-    };
-
-    const { error } = await cloud
-      .from('products')
-      .upsert(row, { onConflict: 'sku' });
-
-    if (error) throw error;
-
-    console.log('PRODUCT SYNC SUCCESS:', sku);
-    return true;
-  } catch (error) {
-    console.error('PRODUCT SYNC FAILED:', error.message);
-    return false;
-  }
-}
-
-async function syncProductsToSupabase() {
+async function syncAllProducts() {
   await requireAdmin();
 
   let success = 0;
   let failed = 0;
 
-  for (const product of db.products) {
-    if (await syncProductToSupabase(product)) {
+  for (const product of state.products) {
+    try {
+      await syncProduct(product);
       success++;
-    } else {
+    } catch (error) {
       failed++;
+      console.error(product.name, error);
     }
   }
 
-  console.log('PRODUCT SYNC RESULT:', { success, failed });
-  return { success, failed };
+  showMessage(`Products synced: ${success}; Failed: ${failed}`);
 }
 
 async function loadCloudProducts() {
-  await loadSupabase();
+  await connectCloud();
 
-  const { data, error } = await cloud
+  const { data, error } = await supabaseClient
     .from('products')
     .select('*')
     .eq('is_active', true)
     .order('name');
 
   if (error) throw error;
-  return data || [];
+
+  state.products = data || [];
+  saveLocal();
+  render();
 }
 
-async function syncCloudOrders() {
+async function saveSale(sale) {
+  await requireAdmin();
+
+  const total = n(sale.total);
+  const record = {
+    ...sale,
+    id: sale.id || uid(),
+    total,
+    created_at: new Date().toISOString()
+  };
+
+  state.sales.push(record);
+  saveLocal();
+
+  const { error } = await supabaseClient
+    .from('sales')
+    .insert(record);
+
+  if (error) {
+    console.error('Cloud sale sync failed:', error);
+    showMessage('Sale saved locally; cloud sync failed: ' + error.message);
+    return false;
+  }
+
+  render();
+  return true;
+}
+
+async function syncAll() {
   try {
-    await requireAdmin();
-
-    const { data, error } = await cloud
-      .from('orders')
-      .select('*,order_items(id,product_id,product_name,sku,quantity)')
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
-
-    db.orders = data || [];
-    saveDatabase();
-    renderOrders();
-
-    return data;
+    await syncAllProducts();
+    await syncOrders();
   } catch (error) {
-    console.error('ORDER SYNC FAILED:', error.message);
-    return [];
+    showMessage('Sync failed: ' + error.message);
   }
 }
 
-async function updateCloudOrderStatus(orderId, status) {
-  try {
-    await requireAdmin();
+async function syncOrders() {
+  await requireAdmin();
 
-    const { error } = await cloud
-      .from('orders')
-      .update({ status })
-      .eq('id', orderId);
+  const { data, error } = await supabaseClient
+    .from('orders')
+    .select('*,order_items(id,product_id,product_name,sku,quantity)')
+    .order('created_at', { ascending: false });
 
-    if (error) throw error;
+  if (error) throw error;
 
-    await syncCloudOrders();
-    notify('Order status updated');
-  } catch (error) {
-    notify(error.message);
-  }
+  state.orders = data || [];
+  saveLocal();
+  render();
 }
 
-function saveProduct(product) {
-  const sku = productSKU(product);
+async function updateOrderStatus(id, status) {
+  await requireAdmin();
 
-  if (!sku || !String(product.name || '').trim()) {
-    notify('Enter product name and SKU');
-    return;
-  }
+  const { error } = await supabaseClient
+    .from('orders')
+    .update({ status })
+    .eq('id', id);
 
-  const existing = db.products.findIndex(
-    item => productSKU(item) === sku
-  );
+  if (error) throw error;
 
-  if (existing >= 0) {
-    db.products[existing] = { ...db.products[existing], ...product };
-  } else {
-    db.products.push({
-      id: uid(),
-      ...product,
-      sku
-    });
-  }
-
-  saveDatabase();
-  renderProducts();
-
-  if (cloud) {
-    syncProductToSupabase(product);
-  }
+  await syncOrders();
 }
 
-function deleteProduct(sku) {
-  db.products = db.products.filter(
-    product => productSKU(product) !== String(sku)
-  );
+function render() {
+  const products = $('productsTable');
 
-  saveDatabase();
-  renderProducts();
-}
+  if (products) {
+    products.innerHTML = state.products.map(p => `
+      <tr>
+        <td>${escapeHTML(p.sku || p.code)}</td>
+        <td>${escapeHTML(p.name)}</td>
+        <td>${escapeHTML(p.brand || '')}</td>
+        <td>${n(p.stock_quantity ?? p.stock)}</td>
+        <td>${n(p.sale_price ?? p.rate)}</td>
+      </tr>
+    `).join('');
+  }
 
-function renderProducts() {
-  const table = $('productsTable');
-  if (!table) return;
+  const count = $('productCount');
+  if (count) count.textContent = state.products.length;
 
-  table.innerHTML = db.products.map(product => `
-    <tr>
-      <td>${escapeHTML(productSKU(product))}</td>
-      <td>${escapeHTML(product.name)}</td>
-      <td>${money(product.purchase_price ?? product.purchase)}</td>
-      <td>${money(product.sale_price ?? product.rate)}</td>
-      <td>${num(product.stock_quantity ?? product.stock ?? product.quantity)}</td>
-      <td><button data-delete="${escapeHTML(productSKU(product))}">Delete</button></td>
-    </tr>
-  `).join('');
+  const orderCount = $('orderCount');
+  if (orderCount) orderCount.textContent = state.orders.length;
 }
 
 function escapeHTML(value) {
-  return String(value ?? '').replace(/[&<>"']/g, character => ({
+  return String(value ?? '').replace(/[&<>"']/g, c => ({
     '&': '&amp;',
     '<': '&lt;',
     '>': '&gt;',
     '"': '&quot;',
     "'": '&#39;'
-  })[character]);
-}
-
-function addToCart(sku, quantity = 1) {
-  const product = db.products.find(item => productSKU(item) === String(sku));
-
-  if (!product) {
-    notify('Product not found');
-    return;
-  }
-
-  const stock = num(product.stock_quantity ?? product.stock ?? product.quantity);
-
-  if (stock < quantity) {
-    notify('Insufficient stock');
-    return;
-  }
-
-  const existing = cart.find(item => item.sku === String(sku));
-
-  if (existing) {
-    existing.quantity += quantity;
-  } else {
-    cart.push({
-      sku: String(sku),
-      name: product.name,
-      price: num(product.sale_price ?? product.rate ?? product.salePrice),
-      quantity
-    });
-  }
-
-  renderCart();
-}
-
-function renderCart() {
-  const area = $('cartRows');
-  if (!area) return;
-
-  area.innerHTML = cart.map(item => `
-    <tr>
-      <td>${escapeHTML(item.name)}</td>
-      <td>${item.quantity}</td>
-      <td>${money(item.price)}</td>
-      <td>${money(item.price * item.quantity)}</td>
-    </tr>
-  `).join('');
-
-  const total = cart.reduce(
-    (sum, item) => sum + item.price * item.quantity, 0
-  );
-
-  if ($('cartTotal')) $('cartTotal').textContent = money(total);
-}
-
-function saveSale() {
-  if (!cart.length) {
-    notify('Cart is empty');
-    return;
-  }
-
-  for (const item of cart) {
-    const product = db.products.find(p => productSKU(p) === item.sku);
-    const stock = num(product?.stock_quantity ?? product?.stock ?? product?.quantity);
-
-    if (!product || stock < item.quantity) {
-      notify('Insufficient stock for ' + item.name);
-      return;
-    }
-  }
-
-  const total = cart.reduce(
-    (sum, item) => sum + item.price * item.quantity, 0
-  );
-
-  for (const item of cart) {
-    const product = db.products.find(p => productSKU(p) === item.sku);
-    const field = product.stock_quantity !== undefined
-      ? 'stock_quantity'
-      : product.stock !== undefined ? 'stock' : 'quantity';
-
-    product[field] = num(product[field]) - item.quantity;
-  }
-
-  db.sales.push({
-    id: uid(),
-    date: new Date().toISOString(),
-    items: structuredClone(cart),
-    total
-  });
-
-  cart = [];
-  saveDatabase();
-  renderAll();
-  notify('Sale saved: ' + money(total));
-}
-
-function renderSales() {
-  const table = $('salesTable');
-  if (!table) return;
-
-  table.innerHTML = db.sales.map(sale => `
-    <tr>
-      <td>${escapeHTML(sale.id)}</td>
-      <td>${new Date(sale.date).toLocaleString()}</td>
-      <td>${money(sale.total)}</td>
-    </tr>
-  `).join('');
-}
-
-function renderOrders() {
-  const table = $('ordersTable');
-  if (!table) return;
-
-  table.innerHTML = db.orders.map(order => `
-    <tr>
-      <td>${escapeHTML(order.id)}</td>
-      <td>${escapeHTML(order.status || 'Pending')}</td>
-      <td>${escapeHTML(order.customer_name || '')}</td>
-    </tr>
-  `).join('');
-}
-
-function renderDashboard() {
-  if ($('totalProducts')) {
-    $('totalProducts').textContent = db.products.length;
-  }
-
-  if ($('totalSales')) {
-    $('totalSales').textContent = money(
-      db.sales.reduce((sum, sale) => sum + num(sale.total), 0)
-    );
-  }
-
-  if ($('totalOrders')) {
-    $('totalOrders').textContent = db.orders.length;
-  }
-}
-
-function renderAll() {
-  renderDashboard();
-  renderProducts();
-  renderSales();
-  renderOrders();
-  renderCart();
-}
-
-async function submitOnlineOrder(order) {
-  try {
-    const response = await fetch(PLACE_ORDER_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': SUPABASE_KEY,
-        'Authorization': 'Bearer ' + SUPABASE_KEY
-      },
-      body: JSON.stringify(order)
-    });
-
-    const responseText = await response.text();
-    let result = {};
-
-    try {
-      result = responseText ? JSON.parse(responseText) : {};
-    } catch {
-      throw new Error(responseText || 'Invalid server response');
-    }
-
-    if (!response.ok || result.success === false) {
-      throw new Error(result.error || 'Order submission failed');
-    }
-
-    notify('Order submitted successfully');
-    return result;
-  } catch (error) {
-    notify(error.message);
-    return null;
-  }
+  })[c]);
 }
 
 function exportBackup() {
-  const blob = new Blob(
-    [JSON.stringify(db, null, 2)],
-    { type: 'application/json' }
-  );
+  const blob = new Blob([JSON.stringify(state, null, 2)], {
+    type: 'application/json'
+  });
 
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
-
   link.href = url;
   link.download = 'avenuex-backup.json';
   link.click();
-
   URL.revokeObjectURL(url);
 }
 
-function importBackup(file) {
-  const reader = new FileReader();
-
-  reader.onload = () => {
-    try {
-      const imported = JSON.parse(reader.result);
-
-      if (!imported || typeof imported !== 'object') {
-        throw new Error('Invalid backup file');
-      }
-
-      db = { ...DEFAULTS, ...imported };
-      db.products ||= [];
-      db.sales ||= [];
-      db.orders ||= [];
-
-      saveDatabase();
-      renderAll();
-      notify('Backup restored');
-    } catch (error) {
-      notify('Import failed: ' + error.message);
-    }
-  };
-
-  reader.readAsText(file);
-}
-
-function bindEvents() {
-  document.addEventListener('click', event => {
-    const deleteButton = event.target.closest('[data-delete]');
-
-    if (deleteButton) {
-      deleteProduct(deleteButton.dataset.delete);
-    }
-  });
-
-  if ($('saveSale')) {
-    $('saveSale').addEventListener('click', saveSale);
-  }
-
-  if ($('adminLogin')) {
-    $('adminLogin').addEventListener('click', async () => {
-      const email = $('adminEmail')?.value;
-      const password = $('adminPassword')?.value;
-
-      if (!email || !password) {
-        notify('Enter email and password');
-        return;
-      }
-
-      await verifyAdmin(email, password);
-    });
-  }
-
-  if ($('adminLogout')) {
-    $('adminLogout').addEventListener('click', logoutAdmin);
-  }
-
-  if ($('syncProducts')) {
-    $('syncProducts').addEventListener('click', async () => {
-      try {
-        const result = await syncProductsToSupabase();
-        notify(`Success: ${result.success} | Failed: ${result.failed}`);
-      } catch (error) {
-        notify(error.message);
-      }
-    });
-  }
-
-  if ($('syncOrders')) {
-    $('syncOrders').addEventListener('click', syncCloudOrders);
-  }
-
-  if ($('exportBackup')) {
-    $('exportBackup').addEventListener('click', exportBackup);
-  }
-
-  if ($('importBackup')) {
-    $('importBackup').addEventListener('change', event => {
-      if (event.target.files[0]) importBackup(event.target.files[0]);
-    });
-  }
-}
-
 async function init() {
-  loadDatabase();
-  bindEvents();
-  renderAll();
+  loadLocal();
+  render();
 
   try {
-    await loadSupabase();
-
-    const { data } = await cloud.auth.getSession();
+    await connectCloud();
+    const { data } = await supabaseClient.auth.getSession();
 
     if (data.session) {
-      currentUser = data.session.user;
-      await syncCloudOrders();
+      await syncAll();
     }
   } catch (error) {
-    console.error('SUPABASE INIT:', error.message);
+    console.error('AVENUEx initialization:', error);
   }
 }
+
+window.AvenueX = {
+  login,
+  logout,
+  saveProduct,
+  syncProduct,
+  syncAllProducts,
+  loadCloudProducts,
+  saveSale,
+  syncOrders,
+  updateOrderStatus,
+  exportBackup,
+  get data() {
+    return state;
+  }
+};
 
 document.addEventListener('DOMContentLoaded', init);

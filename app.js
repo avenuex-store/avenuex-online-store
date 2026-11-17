@@ -12,6 +12,36 @@ const SUPABASE_URL = 'https://mtwlyaauzjlzfpezfzap.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_MOehj93WpdBVu99gwF2Ndw_azfQMESE';
 const PLACE_ORDER_URL = SUPABASE_URL + '/functions/v1/place-order';
 
+async function syncProductsToSupabase() {
+  if (!db?.products?.length) {
+    notify('Website product list is empty.', 'error');
+    return;
+  }
+
+  const rows = db.products.map(p => ({
+    sku: String(p.code),
+    name: String(p.name),
+    brand: String(p.brand || ''),
+    purchase_price: num(p.purchase),
+    sale_price: num(p.rate),
+    stock_quantity: num(p.opening) + num(p.stockIn),
+    is_active: true
+  }));
+
+  const { data, error } = await cloud
+    .from('products')
+    .upsert(rows, { onConflict: 'sku' })
+    .select();
+
+  if (error) {
+    console.error(error);
+    notify('Product sync failed: ' + error.message, 'error');
+    return;
+  }
+
+  notify(`${data.length} products synced successfully.`);
+}
+
 const $ = id => document.getElementById(id);
 const all = selector => [...document.querySelectorAll(selector)];
 const money = (n, c = 'PKR') => {

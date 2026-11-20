@@ -1,0 +1,18 @@
+# Private runtime accounts and licensing
+auth-users.json
+license.json
+issued-licenses.json
+.env
+.env.*
+!.env.example
+
+# Business data and backups
+avenuex-backup.json
+*.backup
+*.bak
+
+# Local files
+__pycache__/
+*.py[cod]
+.DS_Store
+source-workbook-original.xlsm
